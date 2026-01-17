@@ -131,17 +131,12 @@ async def call_ollama_chat(
         # Input attributes (OpenInference format) - log all messages
         for i, msg in enumerate(messages):
             span.set_attribute(f"llm.input_messages.{i}.message.role", msg["role"])
-            content = msg["content"]
-            # Truncate long content for span attributes
-            if len(content) > 1000:
-                content = content[:1000] + "..."
-            span.set_attribute(f"llm.input_messages.{i}.message.content", content)
+            span.set_attribute(f"llm.input_messages.{i}.message.content", msg["content"])
 
-        # Also set input.value as preview
+        # Also set input.value for Phoenix
         last_user = next((m for m in reversed(messages) if m["role"] == "user"), None)
         if last_user:
-            preview = last_user["content"][:500] + "..." if len(last_user["content"]) > 500 else last_user["content"]
-            span.set_attribute("input.value", preview)
+            span.set_attribute("input.value", last_user["content"])
 
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -162,8 +157,7 @@ async def call_ollama_chat(
             output = result.get("message", {}).get("content", "")
 
             # Output attributes
-            output_preview = output[:500] + "..." if len(output) > 500 else output
-            span.set_attribute("output.value", output_preview)
+            span.set_attribute("output.value", output)
             span.set_attribute("llm.output_messages.0.message.role", "assistant")
             span.set_attribute("llm.output_messages.0.message.content", output)
 
