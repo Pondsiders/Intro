@@ -218,8 +218,11 @@ async def process_turn(redis_client: aioredis.Redis, session_id: str, conversati
 Intro, what about this conversation is worth remembering? List the memorable moments as a simple Markdown list (one per line, starting with `-`). If nothing stands out, just say "Nothing notable."
 """
 
+        # Reload prompt fresh each time for hot-reload during development
+        current_prompt = load_prompt()
+
         messages = [
-            {"role": "system", "content": INTRO_PROMPT},
+            {"role": "system", "content": current_prompt},
             {"role": "user", "content": transcript_prompt},
         ]
 

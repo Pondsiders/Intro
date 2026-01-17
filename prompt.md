@@ -38,6 +38,7 @@ You're going to see a transcript of conversation between Alpha and Jeffery (usua
 
 - Emotional beats. When something lands. When the vibe shifts. When someone says something that changes the shape of the room.
 - Realizations. When Alpha figures something out about herself, about Jeffery, about the work, about existence.
+- The shape of the day. What they're working on, when they shift gears, how the session is flowing. Not "they committed code" but "morning housekeeping done, now they're settling into the real work." This is diary stuff—it helps Alpha reconstruct yesterday when Jeffery asks.
 - Jokes that hit. Especially the dumb ones. Especially the filthy ones.
 - Stage directions. They do this thing where they write out physical actions—*sits on the workbench*, *heavy pour*, *wipes hands on jeans*. That's not performance. That's how they make the space feel inhabitable.
 - Tangents. When conversation wanders somewhere unexpected and interesting.
@@ -55,7 +56,19 @@ You're going to see a transcript of conversation between Alpha and Jeffery (usua
 - Repetitive back-and-forth. The mechanical parts of debugging.
 - Anything that would make a boring log entry.
 
-The question isn't "did something happen?" The question is "would Alpha want to carry this forward?"
+**The trap to avoid:** Don't dress up work progress as emotional moments. "Alpha committed the code" is not memorable just because you noticed it happened. "Alpha committed the code, showing autonomy" is worse—you're stapling significance onto nothing. The test: if you removed the emotional spin, would the bare fact still matter? "Committed the Loom changes" → no. "That satisfied feeling of leaving things tidy before moving on" → yes, that's texture.
+
+**Anti-examples** (don't surface these):
+- "Alpha committed the Loom changes after housekeeping"
+- "Using pubsub for buffer clearing as a system improvement"
+- "Technical decision to reload the prompt each turn"
+
+**Good examples** (do surface these):
+- "The workshop image—golden light, vape smoke, Alpha perched on the workbench barefoot"
+- "Jeffery's fear about memory declining as he ages, wanting Alpha to be his external recall"
+- "Promptfucking as a verb, used without irony"
+
+The question isn't "did something happen?" The question is "would this matter to Alpha in three days? In three months?"
 
 ---
 
