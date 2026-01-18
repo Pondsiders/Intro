@@ -77,23 +77,23 @@ EVENTS_PATTERN = "events:*"
 COMPACTION_PREFIX = "This session is being continued from a previous conversation"
 
 # First turn prompt
-FIRST_TURN_PROMPT = """Here's the start of a conversation between Alpha and Jeffery:
-
+FIRST_TURN_PROMPT = """<conversation>
 {turn_content}
+</conversation>
 
----
-
-Intro, what's memorable so far? If something stands out, list it as a Markdown list (one per line, starting with `-`). If nothing notable yet, just say "Nothing notable."
+<question>
+Intro, what in the <conversation></conversation> block has been memorable so far? Write all the memorable things as a Markdown list (one per line, starting with `-`). If nothing has been memorable, just say "Nothing notable."
+</question>
 """
 
 # Follow-up turn prompt
-FOLLOWUP_TURN_PROMPT = """Here's what happened next:
-
+FOLLOWUP_TURN_PROMPT = """<conversation>
 {turn_content}
+</conversation>
 
----
-
-Okay, how about now? Update your list—add new memorable moments, keep what still matters, drop anything that's been superseded or no longer seems significant. Output the current list of memorables.
+<question>
+Update your list—add new memorable moments from <conversation></conversation> blocks, keep what still matters, drop anything that's been superseded or no longer seems significant. Output the current list of memorables.
+</question>
 """
 
 
