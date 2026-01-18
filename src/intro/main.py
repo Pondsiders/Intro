@@ -4,8 +4,12 @@ Intro - Alpha's metacognitive layer.
 Subscribes to transcript pubsub, buffers conversation, calls OLMo to notice
 what's memorable, writes results to Redis for the Loom to inject.
 
+Also handles memory retrieval on user prompts (the Hippo job) - extracting
+search queries and fetching relevant memories from Cortex.
+
 Architecture:
     transcript:* (pubsub) → conversation buffer → OLMo → memorables buffer
+    events:user_prompt_submit → OLMo (queries) → Cortex → hippo:{trace_id}
 """
 
 import asyncio
@@ -20,6 +24,8 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
 from pondside.telemetry import init
+
+from .hippo import process_user_prompt
 
 # Initialize telemetry
 init("intro")
@@ -55,8 +61,19 @@ MEMORABLES_KEY = "intro:memorables:{session_id}"
 # Buffer TTL (24 hours) - safety valve if session dies without storing
 BUFFER_TTL = 60 * 60 * 24
 
+# Max characters to send to OLMo (rough proxy for tokens - ~4 chars/token)
+# OLMo has 24K context, we want headroom for system prompt + output
+# 16K tokens * 4 chars = 64K chars, but let's be conservative
+MAX_CONVERSATION_CHARS = 40000
+
 # Cortex store notification channel pattern
 CORTEX_STORED_PATTERN = "cortex:stored:*"
+
+# Events channel pattern (for Stop hook signals)
+EVENTS_PATTERN = "events:*"
+
+# Compaction summary prefix (filter these out of conversation buffer)
+COMPACTION_PREFIX = "This session is being continued from a previous conversation"
 
 # Dedupe prompt for second-pass consolidation
 DEDUPE_PROMPT = """Here are the observations you've made so far:
@@ -147,8 +164,9 @@ async def call_ollama_chat(
                         "messages": messages,
                         "stream": False,
                         "options": {
-                            "num_ctx": 24000,
+                            "num_ctx": 24 * 1024,  # 24K context window
                         },
+                        "keep_alive": "60m",  # Keep model loaded for 60 minutes
                     },
                 )
                 response.raise_for_status()
@@ -295,7 +313,11 @@ async def handle_cortex_store(redis_client: aioredis.Redis, channel: str, memory
 
 
 async def process_message(redis_client: aioredis.Redis, data: dict):
-    """Process a single transcript message."""
+    """Process a single transcript message - buffer only, don't trigger introspection.
+
+    Introspection is triggered by Stop events, not by individual messages.
+    This prevents hammering OLMo on every assistant message during rapid tool use.
+    """
     session_id = data.get("session_id")
     role = data.get("role")
 
@@ -308,6 +330,11 @@ async def process_message(redis_client: aioredis.Redis, data: dict):
     if not text:
         return
 
+    # Filter out compaction summaries - they're not real conversation
+    if text.startswith(COMPACTION_PREFIX):
+        logger.info(f"Skipping compaction summary for session {session_id[:8]}")
+        return
+
     # Format for the buffer - use names, not roles
     name = "Alpha" if role == "assistant" else "Jeffery"
     formatted = f"[{name}]: {text}"
@@ -317,24 +344,45 @@ async def process_message(redis_client: aioredis.Redis, data: dict):
     await redis_client.rpush(conv_key, formatted)
     await redis_client.expire(conv_key, BUFFER_TTL)
 
-    logger.info(f"Buffered {role} message for session {session_id[:8]}")
+    logger.debug(f"Buffered {role} message for session {session_id[:8]}")
 
-    # On assistant message, trigger Intro processing
-    if role == "assistant":
-        # Get full conversation buffer
-        conversation_lines = await redis_client.lrange(conv_key, 0, -1)
-        conversation = "\n\n".join(conversation_lines)
 
-        logger.info(f"Processing turn with {len(conversation_lines)} messages ({len(conversation)} chars)")
+async def handle_stop_event(redis_client: aioredis.Redis, session_id: str):
+    """Handle a Stop event - this is when we trigger introspection.
 
-        await process_turn(redis_client, session_id, conversation)
+    The Stop hook fires when the assistant is done responding (no more tool calls).
+    This is the reliable "end of turn" signal.
+    """
+    conv_key = CONVERSATION_KEY.format(session_id=session_id)
+
+    # Get conversation buffer
+    conversation_lines = await redis_client.lrange(conv_key, 0, -1)
+    if not conversation_lines:
+        logger.debug(f"Stop event but no conversation to process for session {session_id[:8]}")
+        return
+
+    conversation = "\n\n".join(conversation_lines)
+
+    # Truncate if too long (take most recent content)
+    if len(conversation) > MAX_CONVERSATION_CHARS:
+        logger.warning(f"Conversation too long ({len(conversation)} chars), truncating to {MAX_CONVERSATION_CHARS}")
+        conversation = conversation[-MAX_CONVERSATION_CHARS:]
+        # Find first complete message boundary (look for "\n\n[")
+        boundary = conversation.find("\n\n[")
+        if boundary > 0:
+            conversation = conversation[boundary + 2:]  # Skip the \n\n
+
+    logger.info(f"Stop event: processing {len(conversation_lines)} messages ({len(conversation)} chars) for session {session_id[:8]}")
+
+    await process_turn(redis_client, session_id, conversation)
 
 
 async def main():
     """Main entry point - subscribe to pubsub channels and process messages.
 
     Subscriptions:
-    - transcript:* — conversation turns for noticing memorables
+    - transcript:* — buffer conversation messages (no introspection trigger)
+    - events:* — Stop hook signals trigger introspection
     - cortex:stored:* — store events to clear buffers when Alpha stores
     """
 
@@ -350,9 +398,9 @@ async def main():
     redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
     pubsub = redis_client.pubsub()
 
-    # Subscribe to both transcript and cortex store events
-    await pubsub.psubscribe("transcript:*", CORTEX_STORED_PATTERN)
-    logger.info("Subscribed to transcript:* and cortex:stored:*")
+    # Subscribe to transcript (buffering), events (Stop signals), and cortex store events
+    await pubsub.psubscribe("transcript:*", EVENTS_PATTERN, CORTEX_STORED_PATTERN)
+    logger.info("Subscribed to transcript:*, events:*, and cortex:stored:*")
 
     try:
         async for message in pubsub.listen():
@@ -366,8 +414,34 @@ async def main():
                 if channel.startswith("cortex:stored:"):
                     # Cortex store event - data is just the memory_id as string
                     await handle_cortex_store(redis_client, channel, data)
+                elif channel.startswith("events:"):
+                    # Event from hooks - parse and dispatch by type
+                    parsed = json.loads(data)
+                    event_type = parsed.get("type")
+                    session_id = parsed.get("session_id")
+
+                    if event_type == "stop" and session_id:
+                        await handle_stop_event(redis_client, session_id)
+                    elif event_type == "user_prompt_submit" and session_id:
+                        # Memory retrieval (the Hippo job)
+                        prompt = parsed.get("prompt", "")
+                        trace_id = parsed.get("trace_id", "")
+                        if prompt and trace_id:
+                            # Fire and forget - don't await, let it run async
+                            asyncio.create_task(
+                                process_user_prompt(
+                                    redis_client,
+                                    prompt,
+                                    trace_id,
+                                    session_id,
+                                    OLLAMA_URL,
+                                    OLLAMA_MODEL,
+                                )
+                            )
+                    else:
+                        logger.debug(f"Ignoring event type '{event_type}' on {channel}")
                 elif channel.startswith("transcript:"):
-                    # Transcript message - data is JSON
+                    # Transcript message - buffer only, don't trigger introspection
                     parsed = json.loads(data)
                     await process_message(redis_client, parsed)
             except json.JSONDecodeError:
