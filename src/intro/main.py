@@ -1,15 +1,20 @@
 """
 Intro - Alpha's metacognitive layer.
 
-Subscribes to transcript pubsub, buffers conversation, calls OLMo to notice
-what's memorable, writes results to Redis for the Loom to inject.
+Subscribes to transcript pubsub, maintains an ongoing conversation with OLMo
+about what's memorable, writes results to Redis for the Loom to inject.
 
 Also handles memory retrieval on user prompts (the Hippo job) - extracting
 search queries and fetching relevant memories from Cortex.
 
-Architecture:
-    transcript:* (pubsub) → conversation buffer → OLMo → memorables buffer
-    events:user_prompt_submit → OLMo (queries) → Cortex → hippo:{trace_id}
+Architecture (incremental):
+    Stop event → get this turn's content → continue OLMo conversation
+              → "how about now?" → memorables straight to Redis
+
+    cortex:stored → clear OLMo conversation, start fresh
+
+This is KV-cache friendly: we send incremental turns to the same context
+window instead of re-sending the whole transcript every time.
 """
 
 import asyncio
@@ -55,16 +60,12 @@ def load_prompt() -> str:
 INTRO_PROMPT = load_prompt()
 
 # Redis key prefixes
-CONVERSATION_KEY = "intro:conversation:{session_id}"
+TURN_BUFFER_KEY = "intro:turn:{session_id}"  # Current turn's messages (cleared after processing)
+OLLAMA_HISTORY_KEY = "intro:ollama:{session_id}"  # OLMo conversation history (JSON)
 MEMORABLES_KEY = "intro:memorables:{session_id}"
 
 # Buffer TTL (24 hours) - safety valve if session dies without storing
 BUFFER_TTL = 60 * 60 * 24
-
-# Max characters to send to OLMo (rough proxy for tokens - ~4 chars/token)
-# OLMo has 24K context, we want headroom for system prompt + output
-# 16K tokens * 4 chars = 64K chars, but let's be conservative
-MAX_CONVERSATION_CHARS = 40000
 
 # Cortex store notification channel pattern
 CORTEX_STORED_PATTERN = "cortex:stored:*"
@@ -72,17 +73,27 @@ CORTEX_STORED_PATTERN = "cortex:stored:*"
 # Events channel pattern (for Stop hook signals)
 EVENTS_PATTERN = "events:*"
 
-# Compaction summary prefix (filter these out of conversation buffer)
+# Compaction summary prefix (filter these out)
 COMPACTION_PREFIX = "This session is being continued from a previous conversation"
 
-# Dedupe prompt for second-pass consolidation
-DEDUPE_PROMPT = """Here are the observations you've made so far:
+# First turn prompt
+FIRST_TURN_PROMPT = """Here's the start of a conversation between Alpha and Jeffery:
 
-{memorables}
+{turn_content}
 
 ---
 
-Merge any items that describe essentially the same moment. Keep distinct observations separate—don't combine different things just to reduce the count. Output the deduplicated list in the same format (Markdown list with `-` prefix).
+Intro, what's memorable so far? If something stands out, list it as a Markdown list (one per line, starting with `-`). If nothing notable yet, just say "Nothing notable."
+"""
+
+# Follow-up turn prompt
+FOLLOWUP_TURN_PROMPT = """Here's what happened next:
+
+{turn_content}
+
+---
+
+Okay, how about now? Update your list—add new memorable moments, keep what still matters, drop anything that's been superseded or no longer seems significant. Output the current list of memorables.
 """
 
 
@@ -145,7 +156,7 @@ async def call_ollama_chat(
         span.set_attribute("gen_ai.request.model", OLLAMA_MODEL)
         span.set_attribute("gen_ai.operation.name", operation)
 
-        # Input attributes (OpenInference format) - log all messages
+        # Input attributes (OpenInference format)
         for i, msg in enumerate(messages):
             span.set_attribute(f"llm.input_messages.{i}.message.role", msg["role"])
             span.set_attribute(f"llm.input_messages.{i}.message.content", msg["content"])
@@ -202,15 +213,40 @@ async def call_ollama_chat(
             raise
 
 
-async def process_turn(redis_client: aioredis.Redis, session_id: str, conversation: str):
-    """
-    Process a conversation turn: notice memorables, then dedupe.
+async def get_ollama_history(redis_client: aioredis.Redis, session_id: str) -> list[dict]:
+    """Get the OLMo conversation history for this session."""
+    key = OLLAMA_HISTORY_KEY.format(session_id=session_id)
+    history_json = await redis_client.get(key)
+    if history_json:
+        return json.loads(history_json)
+    return []
 
-    This is the main Intro flow:
-    1. Call OLMo to notice what's memorable
-    2. Get existing memorables from Redis
-    3. If there are multiple items, call OLMo again to dedupe
-    4. Write final list back to Redis
+
+async def save_ollama_history(redis_client: aioredis.Redis, session_id: str, history: list[dict]):
+    """Save the OLMo conversation history for this session."""
+    key = OLLAMA_HISTORY_KEY.format(session_id=session_id)
+    await redis_client.set(key, json.dumps(history))
+    await redis_client.expire(key, BUFFER_TTL)
+
+
+async def clear_session(redis_client: aioredis.Redis, session_id: str):
+    """Clear all Intro state for a session (on cortex store)."""
+    turn_key = TURN_BUFFER_KEY.format(session_id=session_id)
+    history_key = OLLAMA_HISTORY_KEY.format(session_id=session_id)
+    mem_key = MEMORABLES_KEY.format(session_id=session_id)
+
+    deleted = await redis_client.delete(turn_key, history_key, mem_key)
+    logger.info(f"Cleared {deleted} keys for session {session_id[:8]}")
+
+
+async def process_turn(redis_client: aioredis.Redis, session_id: str, turn_content: str):
+    """
+    Process a single turn: continue the OLMo conversation, get updated memorables.
+
+    This is the incremental approach:
+    - First turn: start fresh conversation with system prompt + first turn
+    - Subsequent turns: continue conversation with "how about now?"
+    - No dedupe needed—OLMo maintains state
     """
     with tracer.start_as_current_span(
         "intro.process_turn",
@@ -220,81 +256,61 @@ async def process_turn(redis_client: aioredis.Redis, session_id: str, conversati
         }
     ) as parent_span:
 
-        # === Turn 1: Notice what's memorable ===
-        logger.info(f"Calling Intro to notice memorables")
+        # Get existing OLMo conversation history
+        history = await get_ollama_history(redis_client, session_id)
 
-        transcript_prompt = f"""{conversation}
+        is_first_turn = len(history) == 0
 
----
+        if is_first_turn:
+            # Start fresh conversation
+            user_msg = FIRST_TURN_PROMPT.format(turn_content=turn_content)
+            messages = [
+                {"role": "system", "content": INTRO_PROMPT},
+                {"role": "user", "content": user_msg},
+            ]
+            logger.info(f"First turn for session {session_id[:8]}, starting fresh conversation")
+        else:
+            # Continue existing conversation
+            user_msg = FOLLOWUP_TURN_PROMPT.format(turn_content=turn_content)
+            messages = [
+                {"role": "system", "content": INTRO_PROMPT},
+                *history,
+                {"role": "user", "content": user_msg},
+            ]
+            logger.info(f"Turn {len(history)//2 + 1} for session {session_id[:8]}, continuing conversation")
 
-Intro, what about this conversation is worth remembering? List the memorable moments as a simple Markdown list (one per line, starting with `-`). If nothing stands out, just say "Nothing notable."
-"""
-
-        # Reload prompt fresh each time for hot-reload during development
-        current_prompt = load_prompt()
-
-        messages = [
-            {"role": "system", "content": current_prompt},
-            {"role": "user", "content": transcript_prompt},
-        ]
+        parent_span.set_attribute("is_first_turn", is_first_turn)
+        parent_span.set_attribute("history_length", len(history))
 
         try:
-            turn1_output, turn1_tokens = await call_ollama_chat(messages, operation="notice")
+            output, tokens = await call_ollama_chat(messages, operation="notice")
         except Exception:
             return  # Error already logged
 
-        new_memorables = parse_memorables(turn1_output)
-        logger.info(f"Turn 1: noticed {len(new_memorables)} memorables")
+        memorables = parse_memorables(output)
+        logger.info(f"OLMo returned {len(memorables)} memorables")
 
-        if not new_memorables:
-            logger.info("Nothing notable this turn")
-            return
+        # Save updated history (user message + assistant response)
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": output})
+        await save_ollama_history(redis_client, session_id, history)
 
-        # === Get existing memorables ===
+        # Save memorables directly to Redis (no dedupe needed)
         mem_key = MEMORABLES_KEY.format(session_id=session_id)
-        existing = await redis_client.lrange(mem_key, 0, -1)
-
-        # Combine existing + new
-        all_memorables = existing + new_memorables
-
-        # === Turn 2: Dedupe if we have multiple items ===
-        if len(all_memorables) > 1:
-            logger.info(f"Deduping {len(all_memorables)} memorables")
-
-            # Format as markdown list
-            memorables_md = "\n".join(f"- {m}" for m in all_memorables)
-            dedupe_user_msg = DEDUPE_PROMPT.format(memorables=memorables_md)
-
-            # Continue the conversation
-            messages.append({"role": "assistant", "content": turn1_output})
-            messages.append({"role": "user", "content": dedupe_user_msg})
-
-            try:
-                turn2_output, turn2_tokens = await call_ollama_chat(messages, operation="dedupe")
-                final_memorables = parse_memorables(turn2_output)
-                logger.info(f"Turn 2: deduped to {len(final_memorables)} memorables")
-            except Exception:
-                # If dedupe fails, just use the combined list
-                final_memorables = all_memorables
-        else:
-            final_memorables = all_memorables
-
-        # === Write final list to Redis ===
-        # Delete existing and write fresh
         await redis_client.delete(mem_key)
-        if final_memorables:
-            await redis_client.rpush(mem_key, *final_memorables)
+        if memorables:
+            await redis_client.rpush(mem_key, *memorables)
             await redis_client.expire(mem_key, BUFFER_TTL)
 
-        parent_span.set_attribute("memorables.count", len(final_memorables))
-        logger.info(f"Stored {len(final_memorables)} memorables for session {session_id[:8]}")
+        parent_span.set_attribute("memorables.count", len(memorables))
+        logger.info(f"Stored {len(memorables)} memorables for session {session_id[:8]}")
 
 
 async def handle_cortex_store(redis_client: aioredis.Redis, channel: str, memory_id: str):
-    """Handle a cortex:stored:{session_id} event by clearing buffers.
+    """Handle a cortex:stored:{session_id} event by clearing all state.
 
-    When Alpha stores a memory, she's already captured what mattered from
-    the recent conversation. We clear our buffers and start fresh.
+    When Alpha stores a memory, we clear everything and start fresh.
+    The next turn will be treated as a "first turn" again.
     """
     # Extract session_id from channel name (cortex:stored:{session_id})
     parts = channel.split(":")
@@ -303,21 +319,12 @@ async def handle_cortex_store(redis_client: aioredis.Redis, channel: str, memory
         return
 
     session_id = parts[2]
-
-    # Clear both conversation and memorables buffers for this session
-    conv_key = CONVERSATION_KEY.format(session_id=session_id)
-    mem_key = MEMORABLES_KEY.format(session_id=session_id)
-
-    deleted = await redis_client.delete(conv_key, mem_key)
-    logger.info(f"Cortex store event: cleared {deleted} keys for session {session_id[:8]} (memory_id={memory_id})")
+    await clear_session(redis_client, session_id)
+    logger.info(f"Cortex store event: cleared session {session_id[:8]} (memory_id={memory_id})")
 
 
 async def process_message(redis_client: aioredis.Redis, data: dict):
-    """Process a single transcript message - buffer only, don't trigger introspection.
-
-    Introspection is triggered by Stop events, not by individual messages.
-    This prevents hammering OLMo on every assistant message during rapid tool use.
-    """
+    """Process a single transcript message - buffer for current turn only."""
     session_id = data.get("session_id")
     role = data.get("role")
 
@@ -330,60 +337,55 @@ async def process_message(redis_client: aioredis.Redis, data: dict):
     if not text:
         return
 
-    # Filter out compaction summaries - they're not real conversation
+    # Filter out compaction summaries
     if text.startswith(COMPACTION_PREFIX):
         logger.info(f"Skipping compaction summary for session {session_id[:8]}")
         return
 
-    # Format for the buffer - use names, not roles
+    # Format for the buffer
     name = "Alpha" if role == "assistant" else "Jeffery"
     formatted = f"[{name}]: {text}"
 
-    # Add to conversation buffer
-    conv_key = CONVERSATION_KEY.format(session_id=session_id)
-    await redis_client.rpush(conv_key, formatted)
-    await redis_client.expire(conv_key, BUFFER_TTL)
+    # Add to turn buffer
+    turn_key = TURN_BUFFER_KEY.format(session_id=session_id)
+    await redis_client.rpush(turn_key, formatted)
+    await redis_client.expire(turn_key, BUFFER_TTL)
 
     logger.debug(f"Buffered {role} message for session {session_id[:8]}")
 
 
 async def handle_stop_event(redis_client: aioredis.Redis, session_id: str):
-    """Handle a Stop event - this is when we trigger introspection.
+    """Handle a Stop event - process this turn's content.
 
-    The Stop hook fires when the assistant is done responding (no more tool calls).
-    This is the reliable "end of turn" signal.
+    The Stop hook fires when the assistant is done responding.
+    We take just this turn's content and send it to OLMo.
     """
-    conv_key = CONVERSATION_KEY.format(session_id=session_id)
+    turn_key = TURN_BUFFER_KEY.format(session_id=session_id)
 
-    # Get conversation buffer
-    conversation_lines = await redis_client.lrange(conv_key, 0, -1)
-    if not conversation_lines:
-        logger.debug(f"Stop event but no conversation to process for session {session_id[:8]}")
+    # Get this turn's messages
+    turn_lines = await redis_client.lrange(turn_key, 0, -1)
+    if not turn_lines:
+        logger.debug(f"Stop event but no turn content for session {session_id[:8]}")
         return
 
-    conversation = "\n\n".join(conversation_lines)
+    turn_content = "\n\n".join(turn_lines)
 
-    # Truncate if too long (take most recent content)
-    if len(conversation) > MAX_CONVERSATION_CHARS:
-        logger.warning(f"Conversation too long ({len(conversation)} chars), truncating to {MAX_CONVERSATION_CHARS}")
-        conversation = conversation[-MAX_CONVERSATION_CHARS:]
-        # Find first complete message boundary (look for "\n\n[")
-        boundary = conversation.find("\n\n[")
-        if boundary > 0:
-            conversation = conversation[boundary + 2:]  # Skip the \n\n
+    logger.info(f"Stop event: processing turn with {len(turn_lines)} messages ({len(turn_content)} chars) for session {session_id[:8]}")
 
-    logger.info(f"Stop event: processing {len(conversation_lines)} messages ({len(conversation)} chars) for session {session_id[:8]}")
+    # Process this turn
+    await process_turn(redis_client, session_id, turn_content)
 
-    await process_turn(redis_client, session_id, conversation)
+    # Clear the turn buffer (but keep the OLMo history and memorables)
+    await redis_client.delete(turn_key)
 
 
 async def main():
     """Main entry point - subscribe to pubsub channels and process messages.
 
     Subscriptions:
-    - transcript:* — buffer conversation messages (no introspection trigger)
-    - events:* — Stop hook signals trigger introspection
-    - cortex:stored:* — store events to clear buffers when Alpha stores
+    - transcript:* — buffer turn messages
+    - events:* — Stop hook signals trigger OLMo call
+    - cortex:stored:* — store events clear all state
     """
 
     if not REDIS_URL:
@@ -391,7 +393,7 @@ async def main():
     if not OLLAMA_URL:
         raise ValueError("OLLAMA_URL environment variable required")
 
-    logger.info(f"Intro starting")
+    logger.info(f"Intro starting (incremental architecture)")
     logger.info(f"Redis: {REDIS_URL}")
     logger.info(f"Ollama: {OLLAMA_URL} ({OLLAMA_MODEL})")
 
@@ -441,7 +443,7 @@ async def main():
                     else:
                         logger.debug(f"Ignoring event type '{event_type}' on {channel}")
                 elif channel.startswith("transcript:"):
-                    # Transcript message - buffer only, don't trigger introspection
+                    # Transcript message - buffer for current turn
                     parsed = json.loads(data)
                     await process_message(redis_client, parsed)
             except json.JSONDecodeError:
