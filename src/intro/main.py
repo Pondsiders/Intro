@@ -27,6 +27,7 @@ import httpx
 import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from pondside.telemetry import init
 
@@ -239,7 +240,7 @@ async def clear_session(redis_client: aioredis.Redis, session_id: str):
     logger.info(f"Cleared {deleted} keys for session {session_id[:8]}")
 
 
-async def process_turn(redis_client: aioredis.Redis, session_id: str, turn_content: str):
+async def process_turn(redis_client: aioredis.Redis, session_id: str, turn_content: str, parent_context=None):
     """
     Process a single turn: continue the OLMo conversation, get updated memorables.
 
@@ -247,14 +248,20 @@ async def process_turn(redis_client: aioredis.Redis, session_id: str, turn_conte
     - First turn: start fresh conversation with system prompt + first turn
     - Subsequent turns: continue conversation with "how about now?"
     - No dedupe needed—OLMo maintains state
+
+    Args:
+        parent_context: Optional OpenTelemetry context to parent spans under (from UserPromptSubmit)
     """
     with tracer.start_as_current_span(
         "intro.process_turn",
+        context=parent_context,
         attributes={
             "session_id": session_id[:8],
             "metadata.source": "intro",
         }
     ) as parent_span:
+
+        logger.info(f"Processing turn with {len(turn_content)} chars for session {session_id[:8]}")
 
         # Get existing OLMo conversation history
         history = await get_ollama_history(redis_client, session_id)
@@ -370,10 +377,18 @@ async def handle_stop_event(redis_client: aioredis.Redis, session_id: str):
 
     turn_content = "\n\n".join(turn_lines)
 
-    logger.info(f"Stop event: processing turn with {len(turn_lines)} messages ({len(turn_content)} chars) for session {session_id[:8]}")
+    # Try to get parent context from Redis (set by UserPromptSubmit)
+    parent_context = None
+    try:
+        traceparent = await redis_client.get(f"turn_context:{session_id}")
+        if traceparent:
+            carrier = {"traceparent": traceparent}
+            parent_context = TraceContextTextMapPropagator().extract(carrier=carrier)
+    except Exception:
+        pass  # Fall back to no parent context
 
-    # Process this turn
-    await process_turn(redis_client, session_id, turn_content)
+    # Process this turn (pass parent_context so its spans nest correctly)
+    await process_turn(redis_client, session_id, turn_content, parent_context=parent_context)
 
     # Clear the turn buffer (but keep the OLMo history and memorables)
     await redis_client.delete(turn_key)
