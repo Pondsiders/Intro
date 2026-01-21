@@ -93,7 +93,9 @@ FOLLOWUP_TURN_PROMPT = """<conversation>
 </conversation>
 
 <question>
-Update your list—add new memorable moments from <conversation></conversation> blocks, keep what still matters, drop anything that's been superseded or no longer seems significant. Output the current list of memorables.
+Consider the whole conversation so far—everything in the <conversation></conversation> blocks, not just what's new. Step back and look at the full shape of it. What matters? What would Alpha want to carry forward? What would hurt to lose?
+
+Output a fresh list of memorables. Don't just add to your previous list—reconsider from scratch given everything you've seen.
 </question>
 """
 
