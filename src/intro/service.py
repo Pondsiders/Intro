@@ -172,7 +172,6 @@ class IntroService:
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=self.system_prompt,
                 operation="extract_queries",
-                context_size=16 * 1024,
                 json_format=True,
             )
 

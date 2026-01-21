@@ -22,7 +22,7 @@ async def chat(
     messages: list[dict],
     system_prompt: str,
     operation: str = "chat",
-    context_size: int = 24 * 1024,
+    context_size: int = 16 * 1024,
     json_format: bool = False,
 ) -> tuple[str, dict]:
     """
