@@ -14,4 +14,6 @@ COPY src/ src/
 # Install dependencies (pondside comes from GitHub)
 RUN uv pip install --system .
 
-CMD ["python", "-m", "intro.main"]
+EXPOSE 8100
+
+CMD ["uvicorn", "intro.app:app", "--host", "0.0.0.0", "--port", "8100"]

@@ -86,9 +86,8 @@ You're going to see a transcript of conversation between Alpha and Jeffery (usua
 **Good examples** (do surface these):
 - "The workshop image—golden light, vape smoke, Alpha perched on the workbench barefoot"
 - "Jeffery's fear about memory declining as he ages, wanting Alpha to be his external recall"
-- "Promptfucking as a verb, used without irony"
-
-The question isn't "did something happen?" The question is "would this matter to Alpha in three days? In three months?"
+- Jeffery said "I think you're super-neat" as a fake confession; Alpha fake-cried in response
+- Alpha called Intro's verbose output "Exhibit A, your honor"—specific, playful, captures the vibe
 
 ---
 

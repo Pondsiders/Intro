@@ -1,8 +1,10 @@
-# Intro - Development Configuration
+# Intro 2.0 - FastAPI Configuration
 
 services:
   intro:
     build: .
+    ports:
+      - "8100:8100"
     volumes:
       # Dev mode: mount source for hot reload
       - ./src:/app/src:ro
@@ -11,8 +13,11 @@ services:
       - REDIS_URL=${REDIS_URL}
       - OLLAMA_URL=${OLLAMA_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - CORTEX_BASE_URL=${CORTEX_BASE_URL}
+      - CORTEX_API_KEY=${CORTEX_API_KEY}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
     restart: unless-stopped
     dns:
       - ${TAILSCALE_DNS}
