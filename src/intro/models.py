@@ -22,12 +22,13 @@ class MemoryItem(BaseModel):
     id: int
     content: str
     created_at: str
+    query: str | None = None  # The query that surfaced this memory
 
 
 class PromptResponse(BaseModel):
     """Response from /prompt endpoint."""
-    memories: list[MemoryItem]
-    queries: list[str]  # What we searched for (transparency)
+    memories: list[MemoryItem]  # Each memory now includes the query that surfaced it
+    queries: list[str]  # Kept for backward compatibility / logging
 
 
 class StopRequest(BaseModel):

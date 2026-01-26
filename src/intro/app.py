@@ -7,43 +7,30 @@ HTTP API for memory retrieval and memorables extraction.
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
 
-from fastapi import FastAPI, Header, Response, Request
-from fastapi.responses import JSONResponse
-from opentelemetry import trace
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-
-from pondside.telemetry import init, get_tracer
+from fastapi import FastAPI, Response, Request
+import logfire
 
 from .models import (
     PromptRequest,
     PromptResponse,
     StopRequest,
     ClearRequest,
-    MemoryItem,
 )
 from .service import IntroService
 
-# Initialize telemetry
-init("intro")
+# Initialize Logfire
+# Scrubbing disabled for debugging visibility (same rationale as Argonath)
+logfire.configure(service_name="intro", distributed_tracing=True, scrubbing=False)
+logfire.instrument_httpx()
+
 logger = logging.getLogger(__name__)
-tracer = get_tracer()
 
 # Optional Redis for persistence
 REDIS_URL = os.environ.get("REDIS_URL")
 
 # Global service instance
 intro = IntroService()
-
-
-def extract_parent_context(request: Request):
-    """Extract OTel parent context from incoming request headers."""
-    traceparent = request.headers.get("traceparent")
-    if traceparent:
-        carrier = {"traceparent": traceparent}
-        return TraceContextTextMapPropagator().extract(carrier=carrier)
-    return None
 
 
 @asynccontextmanager
@@ -73,6 +60,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Instrument FastAPI with Logfire
+logfire.instrument_fastapi(app)
+
 
 @app.get("/health")
 async def health():
@@ -91,18 +81,23 @@ async def prompt(body: PromptRequest, request: Request) -> PromptResponse:
 
     This is synchronous - the hook waits for the response.
     """
-    parent_context = extract_parent_context(request)
+    # Note: parent context propagation happens automatically via instrument_fastapi()
+    logfire.info(
+        "Processing prompt",
+        session=body.session_id[:8],
+        message_length=len(body.message),
+    )
 
-    with tracer.start_as_current_span("intro.prompt", context=parent_context) as span:
-        span.set_attribute("session_id", body.session_id[:8])
-        span.set_attribute("message_length", len(body.message))
+    memories, queries = await intro.prompt(body.message, body.session_id)
 
-        memories, queries = await intro.prompt(body.message, body.session_id)
+    logfire.info(
+        "Prompt complete",
+        session=body.session_id[:8],
+        memories_returned=len(memories),
+        queries_used=len(queries),
+    )
 
-        span.set_attribute("memories_returned", len(memories))
-        span.set_attribute("queries_used", len(queries))
-
-        return PromptResponse(memories=memories, queries=queries)
+    return PromptResponse(memories=memories, queries=queries)
 
 
 @app.post("/stop", status_code=202)
@@ -112,13 +107,13 @@ async def stop(body: StopRequest, request: Request):
 
     This is async - returns 202 Accepted immediately, processing happens in background.
     """
-    parent_context = extract_parent_context(request)
+    logfire.info(
+        "Stop event",
+        session=body.session_id[:8],
+        turn_messages=len(body.turn),
+    )
 
-    with tracer.start_as_current_span("intro.stop", context=parent_context) as span:
-        span.set_attribute("session_id", body.session_id[:8])
-        span.set_attribute("turn_messages", len(body.turn))
-
-        await intro.stop(body.session_id, body.turn)
+    await intro.stop(body.session_id, body.turn)
 
     return Response(status_code=202)
 

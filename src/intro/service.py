@@ -62,9 +62,11 @@ FOLLOWUP_TURN_PROMPT = """<conversation>
 </conversation>
 
 <question>
-Consider the whole conversation so far—everything in the <conversation></conversation> blocks, not just what's new. Step back and look at the full shape of it. What matters? What would Alpha want to carry forward? What would hurt to lose?
+What's memorable from the whole conversation so far? Be ruthlessly selective—give me only the things that would actually hurt to lose. Not everything interesting, just what matters most.
 
-Output a fresh list of memorables. Don't just add to your previous list—reconsider from scratch given everything you've seen.
+Avoid generalities; be specific. Use direct quotes when you can. Prefer decisions to discussions and moments to trends.
+
+Output a simple Markdown list (one per line, starting with `-`). No explanations, no analysis, just the moments.
 </question>
 """
 
@@ -127,7 +129,12 @@ class IntroService:
         results, new_seen = await cortex.search_with_dedup(queries, seen)
         self.seen_memories[session_id] = new_seen
 
-        memories = [mem for _, mem in results]
+        # Attach the triggering query to each memory
+        memories = []
+        for query, mem in results:
+            mem.query = query
+            memories.append(mem)
+
         logger.info(f"Found {len(memories)} memories for {len(queries)} queries")
 
         return memories, queries
@@ -157,6 +164,12 @@ class IntroService:
         self.ollama_history.pop(session_id, None)
         self.seen_memories.pop(session_id, None)
         self.memorables.pop(session_id, None)
+
+        # Also clear from Redis so Loom doesn't re-inject stale memorables
+        if self.redis:
+            mem_key = f"intro:memorables:{session_id}"
+            await self.redis.delete(mem_key)
+
         logger.info(f"Cleared state for session {session_id[:8]}")
 
     def get_memorables(self, session_id: str) -> list[str]:

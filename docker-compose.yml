@@ -17,6 +17,7 @@ services:
       - CORTEX_API_KEY=${CORTEX_API_KEY}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}
       - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
     restart: unless-stopped
     dns:
       - ${TAILSCALE_DNS}
