@@ -4,7 +4,7 @@ services:
   intro:
     build: .
     ports:
-      - "8100:8100"
+      - "18060:8100"
     volumes:
       # Dev mode: mount source for hot reload
       - ./src:/app/src:ro
